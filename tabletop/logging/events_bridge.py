@@ -1,24 +1,8 @@
 from __future__ import annotations
 
-import logging
-from typing import Optional
+"""Compatibility helpers for the now-disabled cloud logging pipeline."""
 
-try:  # pragma: no cover - optional dependency
-    import requests
-except Exception:  # pragma: no cover - optional dependency
-    requests = None  # type: ignore[assignment]
-
-from tabletop.logging.async_bridge import enqueue
-from tabletop.logging.pupylabs_cloud import PupylabsCloudLogger
-
-_log = logging.getLogger(__name__)
-
-_session: Optional["requests.Session"]
-if requests is not None:
-    _session = requests.Session()
-else:  # pragma: no cover - optional dependency
-    _session = None
-_client: Optional[PupylabsCloudLogger] = None
+from typing import Dict
 
 
 def init_client(
@@ -27,29 +11,12 @@ def init_client(
     timeout_s: float = 2.0,
     max_retries: int = 3,
 ) -> None:
-    """Initialise the shared Pupylabs cloud client."""
+    """Retained for API compatibility – no longer performs any work."""
 
-    global _client
-    if requests is None or _session is None:
-        _log.warning(
-            "Requests not available; cannot initialise Pupylabs cloud client"
-        )
-        _client = None
-        return
-    _client = PupylabsCloudLogger(_session, base_url, api_key, timeout_s, max_retries)
+    return None
 
 
-def push_async(event: dict) -> None:
-    """Schedule *event* for asynchronous delivery to Pupylabs."""
+def push_async(event: Dict) -> None:
+    """Drop *event* silently now that cloud logging has been removed."""
 
-    if _client is None:
-        _log.debug("Pupylabs client not initialized; dropping event")
-        return
-
-    def _dispatch() -> None:
-        try:
-            _client.send(event)
-        except Exception as exc:  # pragma: no cover - defensive logging
-            _log.exception("Failed to push event: %r", exc)
-
-    enqueue(_dispatch)
+    return None
