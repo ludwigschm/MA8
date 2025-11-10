@@ -1,3 +1,1 @@
-"""UI package for tabletop widgets and assets."""
-
-# TODO: Wire up UI submodules when implementations are available.
+"""UI package for the minimal Bluffing Eyes tabletop demo."""
