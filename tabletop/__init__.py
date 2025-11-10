@@ -1,3 +1,1 @@
-"""Top-level package for the tabletop application."""
-
-# TODO: Populate package exports when modules are implemented.
+"""Tabletop package for the minimal Bluffing Eyes demo."""
