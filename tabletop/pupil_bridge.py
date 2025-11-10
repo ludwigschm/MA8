@@ -9,7 +9,7 @@ import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Dict, Iterable, Optional, Set, Tuple
+from typing import Any, Callable, Dict, Iterable, Optional, Set, Tuple
 
 from tabletop.data.config import ROOT
 from tabletop.logging.pupylabs_cloud import PupylabsCloudLogger, create_cloud_logger
@@ -55,7 +55,7 @@ class NeonDeviceConfig:
         return f"{self.player} ({address})"
 
 
-def _parse_neon_line(line: str) -> Optional[Tuple[str, NeonDeviceConfig]]:
+def _parse_neon_line(line: str) -> Optional[Tuple[str, str, Any]]:
     """Parse a line from the Neon tracker configuration file."""
 
     text = line.strip()
@@ -65,16 +65,43 @@ def _parse_neon_line(line: str) -> Optional[Tuple[str, NeonDeviceConfig]]:
         return None
     key, value = text.split("=", 1)
     player = key.strip().upper()
-    ip = value.strip()
-    if not player or not ip:
+    raw_value = value.strip()
+    if not player or not raw_value:
         return None
-    if player not in {"VP1", "VP2"}:
-        log.warning("Unbekannter Tracker-Eintrag in neon_tracker_ips.txt: %s", player)
+    attribute = "ip"
+    base_key = player
+    if player.endswith("_IP"):
+        base_key = player[:-3]
+        attribute = "ip"
+    elif player.endswith("_ID"):
+        base_key = player[:-3]
+        attribute = "device_id"
+    elif player.endswith("_PORT"):
+        base_key = player[:-5]
+        attribute = "port"
+    elif "_" in player:
+        # Unknown suffix
+        log.warning("Unbekannter Tracker-Parameter in neon_tracker_ips.txt: %s", player)
         return None
-    return (
-        player,
-        NeonDeviceConfig(player=player, ip=ip, metadata={"source": "config_file"}),
-    )
+
+    if base_key not in {"VP1", "VP2"}:
+        log.warning("Unbekannter Tracker-Eintrag in neon_tracker_ips.txt: %s", base_key)
+        return None
+
+    if attribute == "port":
+        try:
+            parsed_value: Any = int(raw_value)
+        except ValueError:
+            log.warning(
+                "Ungültiger Port für %s in neon_tracker_ips.txt: %s",
+                base_key,
+                raw_value,
+            )
+            return None
+    else:
+        parsed_value = raw_value
+
+    return (base_key, attribute, parsed_value)
 
 
 def _load_neon_configs(path: Path) -> Dict[str, NeonDeviceConfig]:
@@ -88,8 +115,22 @@ def _load_neon_configs(path: Path) -> Dict[str, NeonDeviceConfig]:
                 parsed = _parse_neon_line(line)
                 if not parsed:
                     continue
-                player, cfg = parsed
-                configs[player] = cfg
+                player, attribute, value = parsed
+                cfg = configs.get(player)
+                if cfg is None:
+                    cfg = NeonDeviceConfig(
+                        player=player, metadata={"source": "config_file"}
+                    )
+                    configs[player] = cfg
+                if attribute == "ip":
+                    cfg.ip = str(value)
+                    cfg.metadata["ip"] = cfg.ip
+                elif attribute == "port":
+                    cfg.port = int(value)
+                    cfg.metadata["port"] = str(cfg.port)
+                elif attribute == "device_id":
+                    cfg.device_id = str(value)
+                    cfg.metadata["device_id"] = cfg.device_id
     except Exception:  # pragma: no cover - defensive fallback
         log.exception("Fehler beim Laden der Neon-Konfiguration aus %s", path)
     return configs
@@ -313,8 +354,15 @@ class PupilBridge:
         if not cfg.is_configured:
             return
         cfg.started = True
+        metadata = dict(cfg.metadata)
+        if cfg.device_id:
+            metadata.setdefault("device_id", cfg.device_id)
+        if cfg.ip:
+            metadata.setdefault("ip", cfg.ip)
+        if cfg.port:
+            metadata.setdefault("port", str(cfg.port))
         try:
-            descriptor = json.dumps(cfg.metadata) if cfg.metadata else "{}"
+            descriptor = json.dumps(metadata) if metadata else "{}"
         except Exception:
             descriptor = "{}"
         log.info(
