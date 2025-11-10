@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import csv
 import itertools
 import logging
 import os
@@ -8,8 +7,6 @@ import random
 import time
 import uuid
 from contextlib import suppress
-from datetime import datetime
-from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
@@ -25,17 +22,8 @@ from kivy.uix.spinner import Spinner
 from kivy.uix.switch import Switch
 from kivy.uix.textinput import TextInput
 
-from tabletop.data.blocks import load_blocks, load_csv_rounds, value_to_card_path
+from tabletop.data.blocks import load_blocks, value_to_card_path
 from tabletop.data.config import ARUCO_OVERLAY_PATH, ROOT
-from tabletop.logging import async_bridge
-from tabletop.logging.events_bridge import push_async
-from tabletop.logging.events import Events
-from tabletop.logging.round_csv import (
-    close_round_log,
-    init_round_log,
-    round_log_action_label,
-    write_round_log,
-)
 from tabletop.overlay.fixation import (
     generate_fixation_tone,
     play_fixation_tone as overlay_play_fixation_tone,
@@ -45,7 +33,7 @@ from tabletop.overlay.process import start_overlay_process, stop_overlay_process
 from tabletop.state.controller import TabletopController, TabletopState
 from tabletop.state.phases import UXPhase, to_engine_phase
 from tabletop.ui import widgets as ui_widgets
-from tabletop.engine import POINTS_PER_WIN, EventLogger
+from tabletop.engine import POINTS_PER_WIN
 from tabletop.sync.reconciler import TimeReconciler
 from tabletop.utils.async_tasks import AsyncCallQueue
 from tabletop.utils.input_timing import Debouncer
@@ -84,7 +72,7 @@ class _AsyncMarkerBridge:
         def _dispatch() -> None:
             self._owner.send_bridge_event(name, payload_copy)
 
-        async_bridge.enqueue(_dispatch)
+        _dispatch()
 
 
 class TabletopRoot(FloatLayout):
@@ -154,7 +142,7 @@ class TabletopRoot(FloatLayout):
         *,
         controller: Optional[TabletopController] = None,
         state: Optional[TabletopState] = None,
-        events_factory: Callable[[str, str], Events] = Events,
+        events_factory: Optional[Callable[[str, str], Any]] = None,
         start_overlay: Callable[..., Optional[Any]] = start_overlay_process,
         stop_overlay: Callable[[Optional[Any]], Optional[Any]] = stop_overlay_process,
         fixation_runner: Callable[..., Any] = overlay_run_fixation_sequence,
@@ -198,13 +186,8 @@ class TabletopRoot(FloatLayout):
         self.session_id = None
         self.session_storage_id = None
         self.logger = None
-        self.log_dir = Path(ROOT) / 'logs'
         self.session_popup = None
         self.session_configured = False
-        self.round_log_path = None
-        self.round_log_fp = None
-        self.round_log_writer = None
-        self.round_log_buffer = []
         self.overlay_display_index = 0
 
         self._low_latency_disabled = is_low_latency_disabled()
@@ -218,7 +201,7 @@ class TabletopRoot(FloatLayout):
             maxsize=1000,
             perf_logging=self.perf_logging,
         )
-        self.marker_bridge: Optional[_AsyncMarkerBridge] = _AsyncMarkerBridge(self)
+        self.marker_bridge: Optional[_AsyncMarkerBridge] = None
         if self.perf_logging:
             Clock.schedule_interval(self._log_async_metrics, 1.0)
         self._bridge: Optional["PupilBridge"] = None
@@ -460,30 +443,11 @@ class TabletopRoot(FloatLayout):
         self._bridge_recording_block = None
         self._mark_bridge_dirty()
 
-    def _resolve_event_logger(self) -> Optional[EventLogger]:
-        logger_obj = getattr(self, "logger", None)
-        if isinstance(logger_obj, EventLogger):
-            return logger_obj
-        inner = getattr(logger_obj, "_logger", None)
-        if isinstance(inner, EventLogger):
-            return inner
+    def _resolve_event_logger(self) -> Optional[Any]:
         return None
 
     def _ensure_time_reconciler(self) -> None:
-        if self._time_reconciler is not None:
-            return
-        if not self._bridge:
-            return
-        event_logger = self._resolve_event_logger()
-        if event_logger is None:
-            return
-        try:
-            reconciler = TimeReconciler(self._bridge, event_logger)
-        except Exception:
-            log.exception("Zeitabgleich konnte nicht initialisiert werden")
-            return
-        reconciler.start()
-        self._time_reconciler = reconciler
+        return
 
     def _cancel_sync_heartbeat(self) -> None:
         event = self._heartbeat_event
@@ -710,27 +674,9 @@ class TabletopRoot(FloatLayout):
         ) or 'session'
 
         self.session_configured = True
-        self.log_dir.mkdir(parents=True, exist_ok=True)
-        db_path = self.log_dir / f'events_{safe_session_id}.sqlite3'
         self.session_storage_id = safe_session_id
-        self.logger = self.events_factory(self.session_id, str(db_path))
-        self._ensure_time_reconciler()
-        self._schedule_sync_heartbeat(immediate=True)
-        init_round_log(self)
+        self.logger = None
         self.update_role_assignments()
-
-        self.log_event(
-            None,
-            'session_start',
-            {
-                'session_number': self.session_number,
-                'session_id': self.session_id,
-                'aruco_enabled': self.aruco_enabled,
-                'start_block': self.start_block,
-            },
-        )
-        self._mark_bridge_dirty()
-        self._ensure_bridge_recordings()
         self._apply_session_options_and_start()
 
     def _configure_session_from_cli(self, *_args: Any) -> None:
@@ -1798,103 +1744,10 @@ class TabletopRoot(FloatLayout):
             return "P2"
         return "P1" if player == 1 else "P2"
 
-    def _build_cloud_button_event(
-        self,
-        *,
-        player: Optional[int],
-        button_label: str,
-    ) -> Optional[Dict[str, Any]]:
-        if player not in (1, 2):
-            return None
-        session_id = self.session_id
-        if not session_id:
-            return None
-        vp_num = self.role_by_physical.get(player)
-        if vp_num not in (1, 2):
-            return None
-        round_value: Optional[int] = None
-        block_info = self.current_block_info
-        if isinstance(block_info, dict):
-            idx = block_info.get("index")
-            try:
-                if idx is not None:
-                    round_value = int(idx)
-            except (TypeError, ValueError):
-                round_value = None
-        if round_value is None:
-            try:
-                round_value = int(self.round)
-            except Exception:
-                round_value = None
-        if round_value is None:
-            try:
-                round_value = int(self.controller.compute_global_round())
-            except Exception:
-                round_value = 1
-        if round_value <= 0:
-            round_value = 1
-        try:
-            trial_candidate = int(self.round_in_block)
-        except Exception:
-            trial_candidate = 0
-        if trial_candidate <= 0:
-            trial_candidate = round_value
-        trial_value = trial_candidate if isinstance(trial_candidate, int) else round_value
-        event_payload: Dict[str, Any] = {
-            "session": str(session_id),
-            "round": round_value,
-            "trial": trial_value,
-            "player": int(player),
-            "vp": f"VP{vp_num}",
-            "button": button_label,
-        }
-        return event_payload
-
     def log_event(self, player: int, action: str, payload=None):
         if not self.session_configured:
             return
-        payload = payload or {}
-        action_label = round_log_action_label(self, action, payload)
-        cloud_event = self._build_cloud_button_event(
-            player=player,
-            button_label=action_label,
-        )
-        if cloud_event:
-            push_async(cloud_event)
-        if not self.logger:
-            return
-        actor = self._actor_label(player)
-        round_idx = max(0, self.round - 1)
-        self.logger.log(
-            round_idx,
-            self.current_engine_phase(),
-            actor,
-            action,
-            payload
-        )
-        write_round_log(
-            self,
-            actor,
-            action,
-            payload,
-            player,
-            action_label=action_label,
-        )
-        bridge_payload = {
-            "event_id": payload.get("event_id") if isinstance(payload, dict) else None,
-            "actor": actor,
-            "game_player": player,
-            "phase": self.current_engine_phase(),
-            "round_index": round_idx,
-            "payload": payload,
-        }
-        if player in (1, 2):
-            role_value = self.player_roles.get(player)
-            if role_value is not None:
-                bridge_payload["player_role"] = role_value
-        if self.marker_bridge and action != 'round_start':
-            # non-blocking: moved bridge send to async enqueue
-            self.marker_bridge.enqueue(f"action.{action}", bridge_payload)
+        _ = player, action, payload  # retained for call-site compatibility
 
     def prompt_session_number(self):
         if self.session_popup:

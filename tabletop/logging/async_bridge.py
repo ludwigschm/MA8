@@ -1,41 +1,21 @@
-"""Minimal async dispatch queue for bridge calls.
+"""Synchronous helper used as a compatibility shim.
 
-MA2 Bridge-Calls asynchronisiert (MA3-Pattern), Payload vollständig erhalten.
+Historically the tabletop project forwarded bridge related callbacks to a
+background worker.  With the eye-tracking pipeline removed we no longer need to
+queue the calls, but a number of call sites still import :func:`enqueue`.
+
+To keep those sites simple while guaranteeing that nothing is executed on a
+background thread, :func:`enqueue` now invokes the callback immediately.  This
+keeps the public surface intact and makes the helper effectively a no-op when
+``fn`` is ``None``.
 """
 
-from __future__ import annotations
-
-import logging
-import queue
-import threading
-from typing import Callable
-
-_log = logging.getLogger(__name__)
-
-_q: "queue.Queue[Callable[[], None]]" = queue.Queue(maxsize=10000)
+from typing import Callable, Optional
 
 
-def _worker() -> None:
-    while True:
-        try:
-            fn = _q.get()
-            fn()
-        except Exception:  # pragma: no cover - defensive fallback
-            _log.exception("async task failed")
-        finally:
-            _q.task_done()
-
-
-_thread = threading.Thread(target=_worker, name="AsyncBridge", daemon=True)
-_thread.start()
-
-
-def enqueue(fn: Callable[[], None]) -> None:
-    """Schedule *fn* for background execution without blocking the UI."""
+def enqueue(fn: Optional[Callable[[], None]]) -> None:
+    """Execute *fn* immediately when provided."""
 
     if fn is None:
         return
-    try:
-        _q.put_nowait(fn)
-    except queue.Full:
-        _log.warning("async queue full; dropping event")
+    fn()
