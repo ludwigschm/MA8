@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import itertools
-import logging
 import os
 import random
 import time
@@ -51,7 +50,13 @@ from tabletop.ui.widgets import CardWidget, IconButton, RotatableLabel
 
 Window.multitouch_on_demand = True
 
-log = logging.getLogger(__name__)
+
+class _NoLog:
+    def __getattr__(self, _):
+        return lambda *a, **k: None
+
+
+log = _NoLog()
 
 if TYPE_CHECKING:
     from tabletop.pupil_bridge import PupilBridge

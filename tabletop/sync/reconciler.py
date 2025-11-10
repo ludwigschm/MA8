@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import logging
 import math
 import queue
 import statistics
@@ -15,7 +14,13 @@ from typing import Any, Deque, Dict, Iterable, List, Optional, Tuple
 from tabletop.engine import EventLogger
 from tabletop.pupil_bridge import PupilBridge
 
-log = logging.getLogger(__name__)
+
+class _NoLog:
+    def __getattr__(self, _):
+        return lambda *a, **k: None
+
+
+log = _NoLog()
 
 RECENCY_TAU_SECONDS = 180.0
 SLOPE_FREEZE_CONFIDENCE = 0.90
