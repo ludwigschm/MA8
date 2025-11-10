@@ -2,13 +2,18 @@
 
 from __future__ import annotations
 
-import logging
 import queue
 import threading
 import time
 from typing import Callable, Optional, Tuple
 
-log = logging.getLogger(__name__)
+
+class _NoLog:
+    def __getattr__(self, _):
+        return lambda *a, **k: None
+
+
+log = _NoLog()
 
 __all__ = ["AsyncCallQueue"]
 

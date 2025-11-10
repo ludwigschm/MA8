@@ -9,9 +9,8 @@ import random
 import time
 from collections import deque
 from contextlib import suppress
+from pathlib import Path
 from typing import Any, Optional, Sequence, cast
-
-import logging
 
 from kivy.app import App
 from kivy.config import Config
@@ -38,7 +37,14 @@ from tabletop.utils.runtime import (
     is_perf_logging_enabled,
 )
 
-log = logging.getLogger(__name__)
+
+class _NoLog:
+    def __getattr__(self, _):
+        return lambda *a, **k: None
+
+
+log = _NoLog()
+
 
 _KV_LOADED = False
 

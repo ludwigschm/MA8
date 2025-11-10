@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import atexit
 import csv
-import logging
 import queue
 import json
 import pathlib
@@ -30,6 +29,17 @@ from tabletop.utils.runtime import (
     is_low_latency_disabled,
     is_perf_logging_enabled,
 )
+
+
+class _NoLog:
+    def __getattr__(self, _):
+        return lambda *a, **k: None
+
+
+log = _NoLog()
+
+
+ENABLE_PERSISTENCE = False
 
 __all__ = [
     "Phase",
@@ -52,9 +62,6 @@ __all__ = [
     "GameEngine",
     "POINTS_PER_WIN",
 ]
-
-
-log = logging.getLogger(__name__)
 
 
 # Points awarded for a win when stakes/payouts are active.
@@ -192,9 +199,28 @@ class RoundSchedule:
 
 class EventLogger:
     def __init__(self, db_path: str, csv_path: Optional[str] = None):
+        self._enabled = ENABLE_PERSISTENCE
+        self._db_lock = threading.Lock()
+        self._queue_sentinel: object = object()
+        self._event_queue: Optional[
+            "queue.Queue[Tuple[str, int, str, str, str, str, int, str]]"
+        ] = None
+        self._writer_thread: Optional[threading.Thread] = None
+        self._csv_path: Optional[pathlib.Path] = None
+        self._closed = not self._enabled
+        self._use_async = False
+        self._perf_logging = False
+        self._queue_maxsize = 0
+        self._batch_size = 0
+        self._flush_interval = 0.0
+        self._last_queue_log = 0.0
+        self.conn: Optional[sqlite3.Connection] = None
+
+        if not self._enabled:
+            return
+
         pathlib.Path(db_path).parent.mkdir(parents=True, exist_ok=True)
         self.conn = sqlite3.connect(db_path, check_same_thread=False)
-        self._db_lock = threading.Lock()
         with self._db_lock:
             self.conn.execute("PRAGMA journal_mode=WAL;")
             self.conn.execute(
@@ -219,8 +245,6 @@ class EventLogger:
             )
             self._ensure_refinement_schema()
             self.conn.commit()
-        self._csv_path: Optional[pathlib.Path] = None
-        self._closed = False
         if csv_path:
             path = pathlib.Path(csv_path)
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -231,11 +255,6 @@ class EventLogger:
         self._batch_size = 500
         self._flush_interval = 1.0
         self._last_queue_log = 0.0
-        self._queue_sentinel: object = object()
-        self._event_queue: Optional[
-            "queue.Queue[Tuple[str, int, str, str, str, str, int, str]]"
-        ] = None
-        self._writer_thread: Optional[threading.Thread] = None
         if self._use_async:
             self._event_queue = queue.Queue(maxsize=self._queue_maxsize)
             self._writer_thread = threading.Thread(
@@ -247,6 +266,8 @@ class EventLogger:
         atexit.register(self.close)
 
     def _ensure_refinement_schema(self) -> None:
+        if not self._enabled or self.conn is None:
+            return
         cur = self.conn.cursor()
         cur.execute("PRAGMA table_info(event_refinements)")
         columns = {row[1] for row in cur.fetchall()}
@@ -298,6 +319,8 @@ class EventLogger:
             self.conn.commit()
 
     def _writer_loop(self) -> None:
+        if not self._enabled or self._event_queue is None:
+            return
         assert self._event_queue is not None
         pending: List[Tuple[str, int, str, str, str, str, int, str]] = []
         last_flush = time.monotonic()
@@ -330,6 +353,8 @@ class EventLogger:
     def _flush_rows(
         self, rows: List[Tuple[str, int, str, str, str, str, int, str]]
     ) -> None:
+        if not self._enabled or self.conn is None:
+            return
         if not rows:
             return
         start = time.perf_counter()
@@ -357,6 +382,21 @@ class EventLogger:
         t_mono_ns = time.perf_counter_ns()
         t_utc_iso = datetime.now(timezone.utc).isoformat()
         event_id = str(uuid.uuid4())
+        result = {
+            "session_id": session_id,
+            "round_idx": round_idx,
+            "phase": phase.name,
+            "actor": actor,
+            "action": action,
+            "payload": payload,
+            "t_utc_iso": t_utc_iso,
+            "t_mono_ns": t_mono_ns,
+            "event_id": event_id,
+        }
+
+        if not self._enabled or self.conn is None:
+            return result
+
         row = (
             session_id,
             round_idx,
@@ -397,20 +437,10 @@ class EventLogger:
                         self._last_queue_log = time.monotonic()
         else:
             self._flush_rows([row])
-        return {
-            "session_id": session_id,
-            "round_idx": round_idx,
-            "phase": phase.name,
-            "actor": actor,
-            "action": action,
-            "payload": payload,
-            "t_utc_iso": t_utc_iso,
-            "t_mono_ns": t_mono_ns,
-            "event_id": event_id,
-        }
+        return result
 
     def close(self) -> None:
-        if self._closed:
+        if self._closed or not self._enabled or self.conn is None:
             return
         if self._use_async and self._event_queue is not None:
             self._event_queue.put(self._queue_sentinel)
@@ -430,6 +460,8 @@ class EventLogger:
         confidence: float,
         reason: str,
     ) -> None:
+        if not self._enabled or self.conn is None:
+            return
         timestamp = datetime.now(timezone.utc).isoformat()
         with self._db_lock:
             self.conn.execute(
@@ -456,6 +488,8 @@ class EventLogger:
         mapping_version: int,
         confidence: float,
     ) -> None:
+        if not self._enabled:
+            return
         self.upsert_refinement(
             event_id,
             "GLOBAL",
@@ -466,6 +500,8 @@ class EventLogger:
         )
 
     def fetch_events_by_event_id(self, event_id: str) -> List[Dict[str, Any]]:
+        if not self._enabled or self.conn is None:
+            return []
         pattern = f'%"event_id":"{event_id}"%'
         with self._db_lock:
             cur = self.conn.cursor()
@@ -556,12 +592,16 @@ class SessionCsvLogger:
     ]
 
     def __init__(self, path: pathlib.Path):
-        path.parent.mkdir(parents=True, exist_ok=True)
+        self._enabled = ENABLE_PERSISTENCE
         self._path = path
+        self._write_header = False
+        self._buffer: List[List[Any]] = []
+        if not self._enabled:
+            return
+        path.parent.mkdir(parents=True, exist_ok=True)
         file_exists = path.exists()
         file_has_content = file_exists and path.stat().st_size > 0 if file_exists else False
         self._write_header = not file_has_content
-        self._buffer: List[List[Any]] = []
 
     def _action_label(self, actor: str, action: str, payload: Dict[str, Any]) -> str:
         if action == "start_click":
@@ -593,6 +633,8 @@ class SessionCsvLogger:
         round_index_override: Optional[int] = None,
         scores: Optional[Dict[VP, int]] = None,
     ) -> None:
+        if not self._enabled:
+            return
         is_reveal = actor == "SYS" and action == "reveal_and_score"
         if actor == "SYS" and not is_reveal:
             return
@@ -642,9 +684,13 @@ class SessionCsvLogger:
         self._buffer.append(row)
 
     def close(self) -> None:
+        if not self._enabled:
+            return
         self.flush()
 
     def flush(self) -> None:
+        if not self._enabled:
+            return
         if not self._buffer and not self._write_header:
             return
         self._path.parent.mkdir(parents=True, exist_ok=True)
