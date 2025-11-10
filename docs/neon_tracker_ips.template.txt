@@ -1,0 +1,11 @@
+# IP-Konfiguration für Pupil Labs Neon Tracker
+# Kopiere diese Datei nach "neon_tracker_ips.txt" im Projektwurzelverzeichnis
+# und trage die IP-Adressen der Tracker ein.
+#
+# Beispiel:
+# VP1=192.168.0.21
+# VP2=192.168.0.22
+
+VP1=
+VP2=
+

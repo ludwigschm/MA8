@@ -36,6 +36,7 @@ from tabletop.utils.runtime import (
     is_low_latency_disabled,
     is_perf_logging_enabled,
 )
+from tabletop.pupil_bridge import PupilBridge
 
 
 class _NoLog:
@@ -660,11 +661,19 @@ def main(
 
     single_block_mode = session is not None and block is not None
 
+    bridge = PupilBridge()
+    try:
+        bridge.connect()
+    except Exception:
+        log.exception("PupilBridge konnte nicht initialisiert werden")
+        bridge = None
+
     app = TabletopApp(
         session=session,
         block=block,
         player=player,
         players=desired_players,
+        bridge=bridge,
         single_block_mode=single_block_mode,
     )
     app.run()
