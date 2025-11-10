@@ -5,6 +5,8 @@ import os
 import random
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
 from contextlib import suppress
 from typing import TYPE_CHECKING, Any, Callable, Dict, Iterable, List, Optional, Tuple
 
@@ -23,6 +25,8 @@ from kivy.uix.textinput import TextInput
 
 from tabletop.data.blocks import load_blocks, value_to_card_path
 from tabletop.data.config import ARUCO_OVERLAY_PATH, ROOT
+from tabletop.logging.pupylabs_cloud import PupylabsCloudLogger, create_cloud_logger
+from tabletop.logging.round_csv import RoundCsvLogger, round_log_action_label
 from tabletop.overlay.fixation import (
     generate_fixation_tone,
     play_fixation_tone as overlay_play_fixation_tone,
@@ -191,6 +195,9 @@ class TabletopRoot(FloatLayout):
         self.session_id = None
         self.session_storage_id = None
         self.logger = None
+        self._round_logger: Optional[RoundCsvLogger] = None
+        self._cloud_logger: Optional[PupylabsCloudLogger] = None
+        self._log_executor = ThreadPoolExecutor(max_workers=2)
         self.session_popup = None
         self.session_configured = False
         self.overlay_display_index = 0
@@ -653,6 +660,23 @@ class TabletopRoot(FloatLayout):
         index = max(0, min(index, total - 1))
         return index + 1
 
+    def _sanitize_session_label(self, label: str) -> str:
+        sanitized = ''.join(
+            ch if ch.isalnum() or ch in ('-', '_') else '_'
+            for ch in label
+        ).strip()
+        return sanitized or 'session'
+
+    def _create_round_logger(self, session_label: str) -> RoundCsvLogger:
+        sanitized = self._sanitize_session_label(session_label)
+        log_dir = ROOT / 'logs'
+        path = log_dir / f"{sanitized}_actions.csv"
+        return RoundCsvLogger(path)
+
+    def _create_cloud_logger(self) -> Optional[PupylabsCloudLogger]:
+        logger, _ = create_cloud_logger()
+        return logger
+
     def _finalize_session_setup(
         self,
         session_label: str,
@@ -667,16 +691,17 @@ class TabletopRoot(FloatLayout):
         digits = ''.join(ch for ch in session_label if ch.isdigit())
         self.session_number = int(digits) if digits else None
 
+        self._round_logger = self._create_round_logger(session_label)
+        if self._cloud_logger is None:
+            self._cloud_logger = self._create_cloud_logger()
+
         start_choice = start_block_value if start_block_value is not None else self.start_block
         self.start_block = self._clamp_start_block_choice(start_choice)
 
         if aruco_enabled is not None:
             self.aruco_enabled = bool(aruco_enabled)
 
-        safe_session_id = ''.join(
-            ch if ch.isalnum() or ch in ('-', '_') else '_'
-            for ch in self.session_id
-        ) or 'session'
+        safe_session_id = self._sanitize_session_label(self.session_id)
 
         self.session_configured = True
         self.session_storage_id = safe_session_id
@@ -1752,7 +1777,111 @@ class TabletopRoot(FloatLayout):
     def log_event(self, player: int, action: str, payload=None):
         if not self.session_configured:
             return
-        _ = player, action, payload  # retained for call-site compatibility
+
+        payload_dict = dict(payload or {})
+        timestamp = datetime.now(timezone.utc)
+        iso_time = timestamp.isoformat()
+
+        actor_label = self._actor_label(player)
+        actor_vp = None
+        if player in (1, 2):
+            vp_value = self.role_by_physical.get(player)
+            if vp_value in (1, 2):
+                actor_vp = f"VP{vp_value}"
+
+        block_info = self.current_block_info or {}
+        block_label = block_info.get("label") or ""
+        block_index = block_info.get("index")
+        round_in_block = (
+            self.round_in_block
+            if self.round_in_block
+            else payload_dict.get("round_in_block")
+        ) or 0
+
+        plan_info = self.controller.get_current_plan()
+        plan = plan_info[1] if plan_info else None
+        vp1_cards = plan.get("vp1") if isinstance(plan, dict) else None
+        vp2_cards = plan.get("vp2") if isinstance(plan, dict) else None
+
+        winner_label = self._determine_winner_label(payload_dict)
+        score_vp1, score_vp2 = self._score_snapshot_for_log()
+        action_label = round_log_action_label(action, payload_dict)
+
+        row = {
+            "Session": self.session_id or "",
+            "Bedingung": block_label,
+            "Block": block_index if block_index is not None else "",
+            "Runde im Block": round_in_block,
+            "Spieler 1": actor_label,
+            "VP": actor_vp or "",
+            "Karte1 VP1": vp1_cards[0] if vp1_cards else "",
+            "Karte2 VP1": vp1_cards[1] if vp1_cards else "",
+            "Karte1 VP2": vp2_cards[0] if vp2_cards else "",
+            "Karte2 VP2": vp2_cards[1] if vp2_cards else "",
+            "Aktion": action_label,
+            "Zeit": iso_time,
+            "Gewinner": winner_label,
+            "Punktestand VP1": score_vp1,
+            "Punktestand VP2": score_vp2,
+        }
+
+        cloud_event = {
+            "session": self.session_id,
+            "session_number": self.session_number,
+            "block": block_index,
+            "condition": block_label,
+            "round_in_block": round_in_block,
+            "actor": actor_label,
+            "vp": actor_vp,
+            "action": action,
+            "timestamp": iso_time,
+            "payload": payload_dict,
+            "cards": {
+                "vp1": list(vp1_cards) if vp1_cards else None,
+                "vp2": list(vp2_cards) if vp2_cards else None,
+            },
+            "winner": winner_label,
+            "score": {"vp1": score_vp1, "vp2": score_vp2},
+        }
+
+        tasks = []
+        if self._cloud_logger is not None:
+            tasks.append(self._log_executor.submit(self._cloud_logger.send, cloud_event))
+        if self._round_logger is not None:
+            tasks.append(self._log_executor.submit(self._round_logger.log_row, row))
+
+        for future in tasks:
+            try:
+                future.result()
+            except Exception:
+                log.exception("Persistieren des Events fehlgeschlagen: %s", action)
+
+    def _determine_winner_label(self, payload: Dict[str, Any]) -> str:
+        winner_player = payload.get('winner')
+        draw = payload.get('draw')
+        outcome = self.last_outcome if isinstance(self.last_outcome, dict) else {}
+        if winner_player not in (1, 2, None):
+            winner_player = None
+        if draw is None and isinstance(outcome, dict):
+            draw = outcome.get('draw')
+        if winner_player is None and isinstance(outcome, dict):
+            winner_player = outcome.get('winner')
+        if draw:
+            return 'Unentschieden'
+        if winner_player in (1, 2):
+            vp = self.role_by_physical.get(winner_player)
+            if vp in (1, 2):
+                return f'VP{vp}'
+        return ''
+
+    def _score_snapshot_for_log(self) -> Tuple[Any, Any]:
+        block_info = self.current_block_info or {}
+        if not block_info.get('payout'):
+            return ('', '')
+        scores = self.score_state or self.score_state_round_start
+        if not isinstance(scores, dict):
+            return ('', '')
+        return (scores.get(1, ''), scores.get(2, ''))
 
     def prompt_session_number(self):
         if self.session_popup:

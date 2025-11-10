@@ -128,6 +128,8 @@ def run_fixation_sequence(
             payload["block"] = block
         log_event(None, kind, payload or None)
 
+    _log_fixation_event("fixation_start")
+
     controller.fixation_running = True
     controller.pending_fixation_callback = on_complete
     overlay.opacity = 1
@@ -157,6 +159,7 @@ def run_fixation_sequence(
         controller.pending_fixation_callback = None
         if callback:
             callback()
+        _log_fixation_event("fixation_end")
 
     def show_final_live(_dt: float) -> None:
         _set_image_source(image, live_image, fallback="cross")
@@ -164,6 +167,7 @@ def run_fixation_sequence(
 
     def show_stop_and_tone(_dt: float) -> None:
         _set_image_source(image, stop_image, fallback="blank")
+        _log_fixation_event("fixation_blink")
         _log_fixation_event("fixation_flash")
         setattr(controller, "fixation_beep_callback", lambda: _log_fixation_event("fixation_beep"))
         play_fixation_tone(controller)

@@ -1,6 +1,16 @@
-"""No-op stubs for the legacy round logging helpers."""
+"""CSV logging helpers for round actions."""
 
-from typing import Any, Dict, List, Optional
+from __future__ import annotations
+
+import csv
+import logging
+import threading
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Mapping, Optional
+
+
+log = logging.getLogger(__name__)
+
 
 ROUND_LOG_HEADER: List[str] = [
     "Session",
@@ -21,42 +31,54 @@ ROUND_LOG_HEADER: List[str] = [
 ]
 
 
-def init_round_log(app: Any) -> None:
-    """Preserved for compatibility – the game no longer writes CSV files."""
+class RoundCsvLogger:
+    """Thread-safe CSV writer for action logs."""
 
-    setattr(app, "round_log_path", None)
-    setattr(app, "round_log_buffer", [])
-    setattr(app, "round_log_fieldnames", list(ROUND_LOG_HEADER))
-    setattr(app, "round_log_last_flush", 0.0)
+    def __init__(self, path: Path, *, fieldnames: Iterable[str] = ROUND_LOG_HEADER) -> None:
+        self._path = Path(path)
+        self._fieldnames = list(fieldnames)
+        self._write_header = not self._path.exists()
+        self._lock = threading.Lock()
 
+    @property
+    def path(self) -> Path:
+        return self._path
 
-def round_log_action_label(app: Any, action: str, payload: Dict[str, Any]) -> str:
-    """Return a human readable label for UI purposes."""
+    def log_row(self, row: Mapping[str, Any]) -> None:
+        """Append *row* to the CSV file, creating it if necessary."""
 
-    return str(action)
-
-
-def write_round_log(
-    app: Any,
-    actor: str,
-    action: str,
-    payload: Dict[str, Any],
-    player: int,
-    *,
-    action_label: Optional[str] = None,
-) -> None:
-    """Logging disabled – keep the signature but drop all behaviour."""
-
-    return None
-
-
-def flush_round_log(app: Any, *, force: bool = False, wait: bool = True) -> None:
-    """Compatibility shim – nothing to flush anymore."""
-
-    return None
+        normalized = {key: row.get(key, "") for key in self._fieldnames}
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            with self._lock:
+                with open(self._path, "a", encoding="utf-8", newline="") as handle:
+                    writer = csv.DictWriter(handle, fieldnames=self._fieldnames)
+                    if self._write_header:
+                        writer.writeheader()
+                        self._write_header = False
+                    writer.writerow(
+                        {key: _stringify(value) for key, value in normalized.items()}
+                    )
+        except Exception:  # pragma: no cover - defensive fallback
+            log.exception("Fehler beim Schreiben des Runden-Logs %s", self._path)
 
 
-def close_round_log(app: Any) -> None:
-    """Compatibility shim – nothing to close anymore."""
+def _stringify(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    return str(value)
 
-    setattr(app, "round_log_path", None)
+
+def round_log_action_label(action: str, payload: Mapping[str, Any]) -> str:
+    """Create a concise, human readable label for the UI log."""
+
+    base = action.replace("_", " ")
+    if not payload:
+        return base
+    details = ", ".join(f"{key}={value}" for key, value in sorted(payload.items()))
+    return f"{base} ({details})"
+
+
+__all__ = ["ROUND_LOG_HEADER", "RoundCsvLogger", "round_log_action_label"]

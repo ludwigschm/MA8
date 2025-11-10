@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import logging
+import os
 import time
-from typing import Any, Dict
+from typing import Any, Dict, Optional, Tuple
 
 try:  # pragma: no cover - optional dependency
     import requests
@@ -66,3 +67,51 @@ class PupylabsCloudLogger:
                     return
                 time.sleep(delay)
                 delay = min(delay * 2, 1.0)
+
+    def close(self) -> None:
+        try:
+            self.sess.close()
+        except Exception:  # pragma: no cover - defensive fallback
+            pass
+
+
+def _resolve_credentials(
+    base_url: Optional[str], api_key: Optional[str]
+) -> Tuple[Optional[str], Optional[str]]:
+    resolved_base = base_url or os.getenv("PUPILLABS_BASE_URL") or os.getenv(
+        "PUPIL_LABS_BASE_URL"
+    )
+    resolved_key = api_key or os.getenv("PUPILLABS_API_KEY") or os.getenv(
+        "PUPIL_LABS_API_KEY"
+    )
+    return resolved_base, resolved_key
+
+
+def create_cloud_logger(
+    *,
+    base_url: Optional[str] = None,
+    api_key: Optional[str] = None,
+    timeout_s: float = 2.0,
+    max_retries: int = 3,
+) -> Tuple[Optional[PupylabsCloudLogger], Optional["requests.Session"]]:
+    """Create a cloud logger and its underlying session when configured."""
+
+    if requests is None:  # pragma: no cover - optional dependency
+        return (None, None)
+
+    resolved_base, resolved_key = _resolve_credentials(base_url, api_key)
+    if not resolved_base or not resolved_key:
+        return (None, None)
+
+    session = requests.Session()
+    logger = PupylabsCloudLogger(
+        session,
+        resolved_base,
+        resolved_key,
+        timeout_s=timeout_s,
+        max_retries=max_retries,
+    )
+    return (logger, session)
+
+
+__all__ = ["PupylabsCloudLogger", "create_cloud_logger"]
