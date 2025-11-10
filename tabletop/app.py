@@ -37,6 +37,7 @@ from tabletop.utils.runtime import (
     is_perf_logging_enabled,
 )
 from tabletop.pupil_bridge import PupilBridge
+from tabletop.startup import ensure_trackers_recording_sequential
 
 
 class _NoLog:
@@ -667,6 +668,17 @@ def main(
     except Exception:
         log.exception("PupilBridge konnte nicht initialisiert werden")
         bridge = None
+
+    if bridge is not None:
+        try:
+            ensure_trackers_recording_sequential(
+                bridge,
+                session=session,
+                block=block,
+                players=desired_players,
+            )
+        except Exception:
+            log.exception("Failed to initialize tracker recordings before launch")
 
     app = TabletopApp(
         session=session,

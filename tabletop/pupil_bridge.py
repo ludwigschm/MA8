@@ -202,6 +202,23 @@ class PupilBridge:
         address = cfg.address if cfg else None
         log.info("Stoppe Aufnahme für %s (%s)", player, address or "unbekannt")
 
+    def is_recording(self, player: str) -> bool:
+        """Return ``True`` if *player* is currently recording."""
+
+        return player in self._recording
+
+    def wait_until_recording(
+        self, player: str, *, timeout: float = 5.0, poll_interval: float = 0.1
+    ) -> bool:
+        """Poll the recording state for *player* until it becomes active."""
+
+        deadline = time.monotonic() + max(0.0, timeout)
+        while time.monotonic() < deadline:
+            if self.is_recording(player):
+                return True
+            time.sleep(max(0.0, poll_interval))
+        return self.is_recording(player)
+
     # ------------------------------------------------------------------
     # Event helpers
     def _submit(self, fn: Callable[[], None]) -> Future[None]:
